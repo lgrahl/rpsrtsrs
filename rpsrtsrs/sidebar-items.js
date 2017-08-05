@@ -1,0 +1,1 @@
+initSidebarItems({"mod":[["client",""],["colors","Color definitions."],["network","Network protocol."],["server",""],["shapes","Shapes in the game, like units (triangles) and buildings (squares)."],["state","Data structures that can be shared between the server and the client."]]});
