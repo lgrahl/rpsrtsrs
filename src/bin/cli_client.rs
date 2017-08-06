@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::io::Write;
 use std::{thread, time};
 
-use rpsrtsrs::state::GameState;
+use rpsrtsrs::state::{GameState, ClientId};
 use rpsrtsrs::network::{Command, Message};
 
 use docopt::Docopt;
@@ -81,8 +81,9 @@ fn main() {
         let id = args.arg_id.expect("<id> missing");
         let x = args.arg_x.expect("<x> missing");
         let y = args.arg_y.expect("<y> missing");
+        // TODO: Fix client ID
         serialize_into(&mut stream,
-                       &Message::Command(Command::Move(id.into(), [x, y])),
+                       &Message::Command(ClientId(0), Command::Move(id.into(), [x, y])),
                        Infinite)
             .unwrap();
         stream.flush().unwrap();

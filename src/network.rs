@@ -20,10 +20,10 @@ pub enum Command {
 /// This includes connection buildup and game state transfer.
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum Message {
-    Error,
     ClientHello,
     ClientReconnect(ClientId),
     ServerHello(ClientId, WorldState),
-    UpdateGamestate(GameState),
-    Command(Command),
+    UpdateGameState(ClientId, GameState),
+    Command(ClientId, Command),
+    Error(ClientId),
 }

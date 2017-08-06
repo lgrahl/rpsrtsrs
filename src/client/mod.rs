@@ -71,7 +71,8 @@ impl NetworkClient {
                 command.map(|cmd| {
                     println!("Got command: {:?}", cmd);
                     //let cmd = Message::Command(Command::Move(0.into(), [100f64, 100f64]));
-                    serialize_into(&mut command_stream, &Message::Command(cmd), Infinite)
+                    // TODO: Fix client ID
+                    serialize_into(&mut command_stream, &Message::Command(ClientId(0), cmd), Infinite)
                         .unwrap_or_else(|e|println!("Sending command failed: {}", e));
                 });
                 thread::sleep(time::Duration::from_millis(10));

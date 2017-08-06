@@ -24,7 +24,7 @@ impl fmt::Display for UnitId {
 }
 
 /// A client/player identifier.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Debug, Copy, Clone)]
 pub struct ClientId(pub u32);
 
 impl Into<ClientId> for u32 {

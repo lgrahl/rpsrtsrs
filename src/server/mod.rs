@@ -1,21 +1,24 @@
-use std::io::Write;
 use std::io::Result as IoResult;
-use std::net::{TcpListener, TcpStream, SocketAddr, ToSocketAddrs};
+use std::net::{UdpSocket, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread;
 use std::time::Duration;
 use std::ops::RangeFrom;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
-use bincode::{serialize, deserialize_from, Infinite, Bounded};
+use bincode::{serialize, deserialize, Infinite};
 
-use state::{WorldState, GameState, Player, Unit, UnitId};
+use state::{WorldState, GameState, ClientId, Player, Unit, UnitId};
 use network::{Message, Command};
+
+struct Client(ClientId, Receiver<Message>);
 
 /// A `Server` instance holds global server state.
 pub struct Server {
     socket_addr: SocketAddr,
+    clients: HashMap<ClientId, Sender<Message>>,
     world: Arc<Mutex<WorldState>>,
     game: Arc<Mutex<GameState>>,
     /// Generator that returns sequential unit IDs
@@ -36,6 +39,7 @@ impl Server {
         let game = Arc::new(Mutex::new(GameState::new()));
         Ok(Server {
             socket_addr: addr,
+            clients: HashMap::new(),
             world: world,
             game: game,
             client_id_generator: Arc::new(Mutex::new(0..)),
@@ -44,32 +48,142 @@ impl Server {
         })
     }
 
-    pub fn serve(&self) {
-        let tcp_listener = TcpListener::bind(self.socket_addr).unwrap();
-        println!("Start server: {:?}", tcp_listener);
+    pub fn serve(&mut self) {
+        let socket = UdpSocket::bind(self.socket_addr).unwrap();
+        println!("Start server: {:?}", socket);
 
         let game_clone = self.game.clone();
         let unit_targets_clone = self.unit_targets.clone();
         thread::spawn(move || {
             update_world(game_clone, unit_targets_clone);
         });
+        let mut packet_buffer = [0; 128];
 
-        for stream in tcp_listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let world_clone = self.world.clone();
-                    let game_clone = self.game.clone();
-                    let client_id_generator_clone = self.client_id_generator.clone();
-                    let unit_id_generator_clone = self.unit_id_generator.clone();
-                    let unit_targets = self.unit_targets.clone();
-                    println!("Spawning thread...");
-                    thread::spawn(move || {
-                        handle_client(stream, world_clone, game_clone,
-                                      client_id_generator_clone, unit_id_generator_clone, unit_targets);
-                    });
+        // Receive & handle packets
+        loop {
+            let (_, client_addr) = socket.recv_from(&mut packet_buffer).unwrap();
+            let client_message = deserialize(&packet_buffer);
+            match client_message {
+                Ok(message) => {
+                    let new_client = match message {
+                        Message::ClientHello => {
+                            // Get exclusive world access
+                            let mut game_lock = self.game.lock().unwrap();
+
+                            // Create new player for the newly connected client
+                            let client_id = self.client_id_generator
+                                .lock().expect("Could not lock client_id_generator mutex")
+                                .next().expect("No more client IDs available!");
+                            let mut player = Player::new(client_id);
+
+                            // Create four initial units for the player
+                            let coords = [
+                                [50.0f64, 50.0f64], [50.0f64, 100.0f64],
+                                [100.0f64, 50.0f64], [100.0f64, 100.0f64],
+                            ];
+                            for coord in coords.iter() {
+                                let unit_id = self.unit_id_generator
+                                    .lock().expect("Could not lock unit_id_generator mutex")
+                                    .next().expect("No more unit IDs available!");
+                                player.units.push(Unit::new(unit_id, *coord));
+                            }
+
+                            // Add player to the world
+                            let client_id = player.id;
+                            game_lock.players.push(player);
+
+                            // Send ServerHello message
+                            let encoded: Vec<u8> = serialize(
+                                &Message::ServerHello(client_id, self.world.lock().unwrap().clone()),
+                                Infinite
+                            ).unwrap();
+                            socket.send_to(&encoded, client_addr).unwrap();
+
+                            // Create client
+                            let (sender, receiver) = channel();
+                            self.clients.insert(client_id, sender);
+                            Some(Client(client_id, receiver))
+                        },
+                        Message::ClientReconnect(client_id) => {
+                            // Get exclusive world access
+                            let world_lock = self.world.lock().unwrap();
+                            let game_lock = self.game.lock().unwrap();
+
+                            // Find player with specified id
+                            match game_lock.players.iter().find(|player| player.id == client_id) {
+                                Some(_) => {
+                                    println!("Found you :)");
+
+                                    // Send ServerHello message
+                                    let encoded: Vec<u8> = serialize(
+                                        &Message::ServerHello(client_id, world_lock.clone()),
+                                        Infinite
+                                    ).unwrap();
+                                    socket.send_to(&encoded, client_addr).unwrap();
+
+                                    // TODO: Drop previous client?
+
+                                    // Create client
+                                    let (sender, receiver) = channel();
+                                    self.clients.insert(client_id, sender);
+                                    Some(Client(client_id, receiver))
+                                },
+                                None => {
+                                    println!("Reconnect to id {} not possible", client_id);
+
+                                    // Send Error message
+                                    let encoded: Vec<u8> = serialize(
+                                        &Message::Error(client_id),
+                                        Infinite).unwrap();
+                                    socket.send_to(&encoded, client_addr).unwrap();
+                                    None
+                                }
+                            }
+                        },
+                        Message::UpdateGameState(client_id, _) |
+                        Message::Command(client_id, _) |
+                        Message::Error(client_id) => {
+                            // Send message to associated client
+                            match self.clients.get(&client_id) {
+                                Some(sender) => {
+                                    sender.send(message).unwrap();
+                                },
+                                None => {
+                                    println!("Client not connected but sent message: {:?}",
+                                             message);
+                                }
+                            };
+                            None
+                        }
+                        Message::ServerHello(_, _) => {
+                            println!("Unexpected message type: {:?}", message);
+                            None
+                        }
+                    };
+
+                    // Handle new client
+                    match new_client {
+                        Some(client) => {
+                            let Client(client_id, receiver) = client;
+
+                            // Spawn client thread
+                            let socket_clone = socket.try_clone().unwrap();
+                            let world_clone = self.world.clone();
+                            let game_clone = self.game.clone();
+                            let unit_targets = self.unit_targets.clone();
+                            println!("Spawning thread...");
+                            thread::spawn(move || {
+                                handle_client(receiver, socket_clone, client_addr, client_id,
+                                              world_clone, game_clone, unit_targets);
+                            });
+                        },
+                        None => {
+                            // TODO: Is this the way to ignore None in Rust?
+                        }
+                    };
                 }
                 Err(e) => {
-                    println!("{:?}", e);
+                    println!("Invalid packet, error: {:?}", e);
                 }
             }
         }
@@ -79,122 +193,36 @@ impl Server {
 pub type SafeWorldState = Arc<Mutex<WorldState>>;
 pub type SafeUnitTargets = Arc<Mutex<HashMap<UnitId, [f64; 2]>>>;
 
-pub fn handle_client(mut stream: TcpStream,
+pub fn handle_client(receiver: Receiver<Message>,
+                     socket: UdpSocket,
+                     client_addr: SocketAddr,
+                     client_id: ClientId,
                      world: SafeWorldState,
                      game: Arc<Mutex<GameState>>,
-                     client_id_generator: Arc<Mutex<RangeFrom<u32>>>,
-                     unit_id_generator: Arc<Mutex<RangeFrom<u32>>>,
                      unit_targets: SafeUnitTargets) {
 
-    // handle client hello
-    let client_message = deserialize_from(&mut stream, Bounded(128));
-    match client_message {
-        Ok(message) => {
-            match message {
-                Message::ClientHello => {
-                    // Get exclusive world access
-                    let mut game_lock = game.lock().unwrap();
-
-                    // Create new player for the newly connected client
-                    let client_id = client_id_generator
-                        .lock().expect("Could not lock client_id_generator mutex")
-                        .next().expect("No more client IDs available!");
-                    let mut player = Player::new(client_id);
-
-                    // Create four initial units for the player
-                    let coords = [
-                        [50.0f64, 50.0f64], [50.0f64, 100.0f64], [100.0f64, 50.0f64], [100.0f64, 100.0f64],
-                    ];
-                    for coord in coords.iter() {
-                        let unit_id = unit_id_generator
-                            .lock().expect("Could not lock unit_id_generator mutex")
-                            .next().expect("No more unit IDs available!");
-                        player.units.push(Unit::new(unit_id, *coord));
-                    }
-
-                    // Add player to the world
-                    let player_id = player.id;
-                    game_lock.players.push(player);
-
-                    // Send ServerHello message
-                    let encoded: Vec<u8> = serialize(
-                        &Message::ServerHello(player_id, world.lock().unwrap().clone()),
-                        Infinite
-                    ).unwrap();
-                    stream.write(&encoded).unwrap();
-                },
-                Message::ClientReconnect(id) => {
-                    // Get exclusive world access
-                    let world_lock = world.lock().unwrap();
-                    let game_lock = game.lock().unwrap();
-
-                    // Find player with specified id
-                    match game_lock.players.iter().find(|player| player.id == id) {
-                        Some(_) => {
-                            println!("Found you :)");
-
-                            // Send ServerHello message
-                            let encoded: Vec<u8> = serialize(
-                                &Message::ServerHello(id, world_lock.clone()),
-                                Infinite
-                            ).unwrap();
-                            stream.write(&encoded).unwrap();
-                        },
-                        None => {
-                            println!("Reconnect to id {} not possible", id);
-
-                            // Send Error message
-                            let encoded: Vec<u8> = serialize(
-                                &Message::Error,
-                                Infinite).unwrap();
-                            stream.write(&encoded).unwrap();
-                            return  // Don't enter game loop
-                        }
-                    }
-                },
-                _ => {
-                    println!("Did not receive ClientHello: {:?}", message);
-                    let encoded: Vec<u8> = serialize(&Message::Error, Infinite).unwrap();
-                    stream.write(&encoded).unwrap();
-                    return  // Don't enter game loop
-                }
-            }
-        }
-        Err(e) => {
-            println!("Error: {:?}", e);
-            return  // Don't enter game loop
-        }
-    }
-
-    let mut command_stream = stream.try_clone().unwrap();
+    let command_socket = socket.try_clone().unwrap();
     let world_clone = world.clone();
     let game_clone = game.clone();
     let unit_targets_clone = unit_targets.clone();
+    let client_addr_clone = client_addr.clone();
+
     // Command receiver loop
     thread::spawn(move || {
         loop {
-            let client_message = deserialize_from(&mut command_stream, Bounded(128));
-            match client_message {
-                Ok(message) => {
-                    match message {
-                        Message::Command(command) => {
-                            let world_lock = world_clone.lock().unwrap();
-                            let mut game_lock = game_clone.lock().unwrap();
-                            let mut unit_targets_lock = unit_targets_clone.lock().unwrap();
-                            handle_command(&world_lock, &mut game_lock, &mut unit_targets_lock, &command);
-                        },
-                        _ => {
-                            println!("Did receive unexpected message: {:?}", message);
-                            let encoded: Vec<u8> = serialize(&Message::Error, Infinite).unwrap();
-                            command_stream.write(&encoded).unwrap();
-                            return
-                        },
-                    }
+            let message = receiver.recv().unwrap();
+            match message {
+                Message::Command(_, command) => {
+                    let world_lock = world_clone.lock().unwrap();
+                    let mut game_lock = game_clone.lock().unwrap();
+                    let mut unit_targets_lock = unit_targets_clone.lock().unwrap();
+                    handle_command(&world_lock, &mut game_lock, &mut unit_targets_lock, &command);
                 },
-                Err(e) => {
-                    println!("Error: {:?}", e);
-                    return;
-                }
+                _ => {
+                    println!("Did receive unexpected message: {:?}", message);
+                    let encoded: Vec<u8> = serialize(&Message::Error(client_id), Infinite).unwrap();
+                    command_socket.send_to(&encoded, client_addr_clone).unwrap();
+                },
             };
         }
     });
@@ -205,7 +233,7 @@ pub fn handle_client(mut stream: TcpStream,
             let game_lock = game.lock().unwrap();
             serialize(&*game_lock, Infinite).unwrap()
         };
-        match stream.write(&encoded) {
+        match socket.send_to(&encoded, client_addr) {
             Err(e) => {
                 println!("Error: {:?}", e);
                 return;
